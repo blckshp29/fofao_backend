@@ -1,0 +1,237 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List
+from datetime import datetime
+# Assuming FinancialRecord is defined in your financial.py file:
+from app.routes.financial import FinancialRecord
+
+from .. import models, schemas
+from ..database import get_db
+from ..models import ScheduledTask, Field, User
+from ..schemas import ScheduledTaskCreate, ScheduledTask as ScheduledTaskSchema
+from ..scheduling.service import SchedulingService
+from ..decision_tree.engine import DecisionTreeEngine
+from ..schemas import DecisionTreeRequest, DecisionTreeResponse, OptimizationRequest, OptimizationResponse
+from .auth import get_current_user
+
+
+router = APIRouter()
+scheduling_service = SchedulingService()
+decision_tree = DecisionTreeEngine()
+
+@router.post("/scheduling/service", response_model=ScheduledTaskSchema)
+def create_scheduled_task(
+    task: ScheduledTaskCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Verify field belongs to user
+    field = db.query(Field).filter(
+        Field.id == task.field_id,
+        Field.user_id == current_user.id
+    ).first()
+    
+    if not field:
+        raise HTTPException(status_code=404, detail="Field not found")
+    
+    return scheduling_service.create_scheduled_task(db, task, current_user.id)
+
+@router.get("/scheduling/tasks", response_model=List[ScheduledTaskSchema])
+def get_scheduled_tasks(
+    status: str = None,
+    field_id: int = None,
+    start_date: datetime = None,
+    end_date: datetime = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = db.query(ScheduledTask).filter(ScheduledTask.user_id == current_user.id)
+    
+    if status:
+        query = query.filter(ScheduledTask.status == status)
+    if field_id:
+        query = query.filter(ScheduledTask.field_id == field_id)
+    if start_date:
+        query = query.filter(ScheduledTask.scheduled_date >= start_date)
+    if end_date:
+        query = query.filter(ScheduledTask.scheduled_date <= end_date)
+    
+    tasks = query.order_by(ScheduledTask.scheduled_date).all()
+    return tasks
+
+@router.post("/scheduling/generate-optimized/{field_id}")
+def generate_optimized_schedule(
+    field_id: int,
+    operations: List[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Verify field belongs to user
+    field = db.query(Field).filter(
+        Field.id == field_id,
+        Field.user_id == current_user.id
+    ).first()
+    
+    if not field:
+        raise HTTPException(status_code=404, detail="Field not found")
+    
+    tasks = scheduling_service.generate_optimized_schedule(
+        db, field_id, current_user.id, operations
+    )
+    
+    return {
+        "message": f"Generated {len(tasks)} optimized tasks",
+        "tasks": tasks,
+        "field_id": field_id
+    }
+
+@router.post("/scheduling/decision-tree/recommend", response_model=DecisionTreeResponse)
+def get_decision_tree_recommendation(
+    request: DecisionTreeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Verify field belongs to user
+    field = db.query(Field).filter(
+        Field.id == request.field_id,
+        Field.user_id == current_user.id
+    ).first()
+    
+    if not field:
+        raise HTTPException(status_code=404, detail="Field not found")
+    
+    # Get weather data
+    from ..weather.service import WeatherService
+    weather_service = WeatherService()
+    
+    weather_request = {
+        "latitude": field.location_lat or 13.0,
+        "longitude": field.location_lon or 123.0,
+        "days": 30
+    }
+    
+    weather_data = weather_service.get_weather_forecast(weather_request)
+    
+    # Get current budget from financial records
+    financial_records = db.query(FinancialRecord).filter(
+        FinancialRecord.user_id == current_user.id,
+        FinancialRecord.field_id == request.field_id
+    ).all()
+    
+    total_expenses = sum(r.amount for r in financial_records if r.transaction_type == "expense")
+    # Simplified budget calculation
+    current_budget = 100000 - total_expenses  # Example starting budget
+    
+    return decision_tree.predict_optimal_date(
+        db, request, weather_data, current_budget
+    )
+
+@router.post("/scheduling/optimize", response_model=OptimizationResponse)
+def optimize_schedule(
+    request: OptimizationRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Verify field belongs to user
+    field = db.query(Field).filter(
+        Field.id == request.field_id,
+        Field.user_id == current_user.id
+    ).first()
+    
+    if not field:
+        raise HTTPException(status_code=404, detail="Field not found")
+    
+    # Get decision tree recommendation
+    dt_request = DecisionTreeRequest(
+        field_id=request.field_id,
+        operation_type=request.operation_type,
+        budget_constraint=request.current_budget
+    )
+    
+    # Get weather data
+    from ..weather.service import WeatherService
+    weather_service = WeatherService()
+    
+    weather_request = {
+        "latitude": field.location_lat or 13.0,
+        "longitude": field.location_lon or 123.0,
+        "days": 30
+    }
+    
+    weather_data = weather_service.get_weather_forecast(weather_request)
+    
+    dt_response = decision_tree.predict_optimal_date(
+        db, dt_request, weather_data, request.current_budget
+    )
+    
+    # Calculate predicted yield value
+    predicted_yield_value = decision_tree._predict_yield(
+        field.crop_type, request.operation_type.value,
+        dt_response.confidence_score * 100, field.area_hectares
+    )
+    
+    # Calculate Net Financial Return
+    nfr = decision_tree.calculate_net_financial_return(
+        predicted_yield_value, dt_response.estimated_cost
+    )
+    
+    # Check budget constraint
+    budget_constraint_satisfied = dt_response.estimated_cost <= request.current_budget
+    
+    return OptimizationResponse(
+        optimal_date=dt_response.recommended_date,
+        predicted_yield_value=predicted_yield_value,
+        total_projected_cost=dt_response.estimated_cost,
+        net_financial_return=nfr,
+        weather_conditions={
+            "risk_level": dt_response.weather_risk,
+            "confidence": dt_response.confidence_score
+        },
+        budget_constraint_satisfied=budget_constraint_satisfied,
+        recommendation=dt_response.recommendation_reason
+    )
+
+@router.get("/scheduling/farm-cycle/{field_id}")
+def get_farm_cycle_timeline(
+    field_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Verify field belongs to user
+    field = db.query(Field).filter(
+        Field.id == field_id,
+        Field.user_id == current_user.id
+    ).first()
+    
+    if not field:
+        raise HTTPException(status_code=404, detail="Field not found")
+    
+    return scheduling_service.calculate_farm_cycle_timeline(db, field_id)
+
+@router.patch("/scheduling/tasks/{task_id}", response_model=schemas.ScheduledTask)
+def update_task(
+    task_id: int, 
+    task_update: schemas.ScheduledTaskUpdate, 
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
+    # 1. Search for the task by ID and verify the user owns it
+    task_query = db.query(models.ScheduledTask).filter(
+        models.ScheduledTask.id == task_id,
+        models.ScheduledTask.user_id == current_user.id
+    )
+    
+    db_task = task_query.first()
+
+    if not db_task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # 2. Convert the input to a dictionary and REMOVE any fields the user didn't send
+    # This prevents overwriting existing data with None
+    update_data = task_update.model_dump(exclude_unset=True)
+
+    # 3. Execute the update
+    task_query.update(update_data, synchronize_session=False)
+    db.commit()
+
+    return task_query.first()
