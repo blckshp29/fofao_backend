@@ -1,0 +1,12 @@
+# --- SQLite Specific ---
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-shm
+*.db-wal
+
+# --- Development Folders ---
+node_modules/
+__pycache__/
+.env
